@@ -129,11 +129,38 @@ fn resolve_target_cidrs(args: &DiscoverArgs) -> Result<Vec<Ipv4Net>> {
             continue;
         };
 
-        let net = Ipv4Net::new(v4.ip, v4.prefixlen)
-            .context("invalid local interface CIDR")?
-            .trunc();
-        if seen.insert((net.addr(), net.prefix_len())) {
-            cidrs.push(net);
+        // Auto-detected masks can be too narrow (/30-/32) or too broad (/8-/16) for
+        // practical camera discovery. Normalize to a local /24 where needed.
+        let mut candidates = Vec::with_capacity(2);
+        if v4.prefixlen < 24 {
+            candidates.push(
+                Ipv4Net::new(v4.ip, 24)
+                    .context("invalid normalized local /24 CIDR")?
+                    .trunc(),
+            );
+        } else if v4.prefixlen >= 30 {
+            candidates.push(
+                Ipv4Net::new(v4.ip, v4.prefixlen)
+                    .context("invalid local interface CIDR")?
+                    .trunc(),
+            );
+            candidates.push(
+                Ipv4Net::new(v4.ip, 24)
+                    .context("invalid widened local /24 CIDR")?
+                    .trunc(),
+            );
+        } else {
+            candidates.push(
+                Ipv4Net::new(v4.ip, v4.prefixlen)
+                    .context("invalid local interface CIDR")?
+                    .trunc(),
+            );
+        }
+
+        for net in candidates {
+            if seen.insert((net.addr(), net.prefix_len())) {
+                cidrs.push(net);
+            }
         }
     }
 
