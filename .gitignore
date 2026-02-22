@@ -1,0 +1,8 @@
+# macOS
+.DS_Store
+
+# Rust build output
+/target/
+
+# Local Codex skill metadata (do not publish yet)
+SKILL.MD
