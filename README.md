@@ -48,7 +48,7 @@ rtsp-tui
 
 Inside the app:
 1. Press `Ctrl+S` to open **Settings**.
-2. In **Select Cameras**, use `Up/Down` and `Ctrl+Enter` to toggle streams.
+2. In **Select Cameras**, use `Up/Down` and `Enter` to toggle streams.
 3. Press `Tab` to switch to **Camera Auth** and set:
    - Display Name
    - Auth Username
@@ -63,7 +63,7 @@ Inside the app:
 
 ### Settings
 - `Up/Down`: Move selection (stream list or auth field focus)
-- `Ctrl+Enter`: Toggle selected stream on/off
+- `Enter`: Toggle selected stream on/off
 - `Tab`: Switch between stream list and auth panel
 - `Ctrl+B`: Back to viewer
 - `Ctrl+Q`: Quit

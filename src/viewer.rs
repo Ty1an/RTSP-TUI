@@ -563,9 +563,39 @@ fn extract_credentials(parsed: &Url) -> Option<Credentials> {
     }
 
     Some(Credentials {
-        username: parsed.username().to_owned(),
-        password: parsed.password().unwrap_or("").to_owned(),
+        username: percent_decode_userinfo(parsed.username()),
+        password: percent_decode_userinfo(parsed.password().unwrap_or("")),
     })
+}
+
+fn percent_decode_userinfo(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut idx = 0;
+
+    while idx < bytes.len() {
+        if bytes[idx] == b'%' && idx + 2 < bytes.len()
+            && let (Some(hi), Some(lo)) = (hex_value(bytes[idx + 1]), hex_value(bytes[idx + 2]))
+        {
+            decoded.push((hi << 4) | lo);
+            idx += 3;
+            continue;
+        }
+
+        decoded.push(bytes[idx]);
+        idx += 1;
+    }
+
+    String::from_utf8_lossy(&decoded).into_owned()
+}
+
+const fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn pick_h264_stream(session: &Session<retina::client::Described>) -> Result<usize> {

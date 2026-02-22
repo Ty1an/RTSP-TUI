@@ -39,11 +39,13 @@ use std::path::PathBuf;
 use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
-use tokio::sync::watch;
+use tokio::sync::{mpsc as tokio_mpsc, watch};
 use tokio::task::JoinHandle;
 use url::Url;
 
 const LIVE_TARGET_FPS: u16 = 20;
+const DISCOVERY_RESCAN_INTERVAL: Duration = Duration::from_secs(30);
+const DISCOVERY_RETRY_INTERVAL: Duration = Duration::from_secs(6);
 const DELTA_MAX_AREA_PERCENT: usize = 60;
 const MIN_RENDER_WIDTH: usize = 96;
 const MIN_RENDER_HEIGHT: usize = 54;
@@ -212,7 +214,6 @@ pub async fn run_tui() -> Result<()> {
 
     let mut terminal = init_terminal()?;
     let mut app = App::load();
-    app.start_discovery(app.discovery_args());
 
     let run_result = run_loop(&mut terminal, &mut app).await;
     let restore_result = restore_terminal(&mut terminal);
@@ -228,7 +229,8 @@ async fn run_loop(terminal: &mut AppTerminal, app: &mut App) -> Result<()> {
 
     while running {
         let frame_started = Instant::now();
-        app.on_tick();
+        app.sync_discovery_lifecycle();
+        app.poll_discovery_events();
         app.poll_discovery_result().await;
         app.sync_live_viewer_workers();
 
@@ -321,12 +323,16 @@ struct App {
     status: String,
     auth_notice: String,
     discovery_form: DiscoveryForm,
+    discovered_cache: Vec<DiscoveredStream>,
     discovered: Vec<DiscoveredItem>,
     discovered_cursor: usize,
     selected_streams: Vec<SelectedStream>,
     pending_discovery: Option<JoinHandle<Result<Vec<DiscoveredStream>>>>,
+    pending_discovery_events_rx: Option<tokio_mpsc::UnboundedReceiver<discovery::DiscoveryEvent>>,
+    discovery_progress: discovery::DiscoveryProgress,
     discovery_started_at: Option<Instant>,
-    ui_tick: u64,
+    next_discovery_at: Option<Instant>,
+    discovery_enabled: bool,
     live_stream_specs: Vec<LiveStreamSpec>,
     live_tiles: Vec<Arc<EmbeddedTileState>>,
     live_workers: Vec<JoinHandle<()>>,
@@ -392,12 +398,16 @@ impl App {
             status: String::new(),
             auth_notice,
             discovery_form: DiscoveryForm::default(),
+            discovered_cache: discovery_cache.streams.clone(),
             discovered,
             discovered_cursor: 0,
             selected_streams,
             pending_discovery: None,
+            pending_discovery_events_rx: None,
+            discovery_progress: discovery::DiscoveryProgress::default(),
             discovery_started_at: None,
-            ui_tick: 0,
+            next_discovery_at: Some(Instant::now()),
+            discovery_enabled: true,
             live_stream_specs: Vec::new(),
             live_tiles: Vec::new(),
             live_workers: Vec::new(),
@@ -407,10 +417,6 @@ impl App {
             kitty_images_drawn: false,
             kitty_upload_states: Vec::new(),
         }
-    }
-
-    fn on_tick(&mut self) {
-        self.ui_tick = self.ui_tick.wrapping_add(1);
     }
 
     fn draw(&self, frame: &mut ratatui::Frame<'_>) {
@@ -544,6 +550,10 @@ impl App {
                         format!("  net {:.1} kbps", snapshot.network_kbps),
                         Style::default().fg(color_muted()),
                     ),
+                    Span::styled(
+                        format!("  {}", snapshot.status),
+                        Style::default().fg(status_color),
+                    ),
                 ]);
                 frame.render_widget(
                     Paragraph::new(Line::default())
@@ -559,7 +569,11 @@ impl App {
             }
         }
 
-        let footer_spans = action_hint_spans(&[("Ctrl+S", "Settings"), ("Ctrl+Q", "Quit")]);
+        let footer_spans = action_hint_spans(&[
+            ("Ctrl+L", "Toggle Discovery"),
+            ("Ctrl+S", "Settings"),
+            ("Ctrl+Q", "Quit"),
+        ]);
         let footer = Paragraph::new(Line::from(footer_spans))
             .style(Style::default().fg(color_text()))
             .block(panel_block("⌘", "Actions", false));
@@ -587,10 +601,15 @@ impl App {
 
         let mut discovery_lines = Vec::new();
         discovery_lines.push(Line::from(Span::styled(
-            "Background discovery is running continuously.",
+            "Discovery runs only while this Settings page is open.",
             Style::default().fg(color_text()),
         )));
-        if self.pending_discovery.is_some() {
+        if !self.discovery_enabled {
+            discovery_lines.push(Line::from(Span::styled(
+                "Discovery is paused (Ctrl+L to resume).",
+                Style::default().fg(color_warning()),
+            )));
+        } else if self.pending_discovery.is_some() {
             discovery_lines.push(Line::from(vec![Span::styled(
                 self.discovery_loading_bar(42),
                 Style::default()
@@ -601,9 +620,29 @@ impl App {
                 self.discovery_phase_text(),
                 Style::default().fg(color_muted()),
             )]));
+            discovery_lines.push(Line::from(vec![Span::styled(
+                format!(
+                    "Progress: {}/{} probes",
+                    self.discovery_progress
+                        .completed
+                        .min(self.discovery_progress.total),
+                    self.discovery_progress.total
+                ),
+                Style::default().fg(color_muted()),
+            )]));
+            if let Some(started_at) = self.discovery_started_at {
+                discovery_lines.push(Line::from(vec![Span::styled(
+                    format!("Elapsed: {:.1}s", started_at.elapsed().as_secs_f32()),
+                    Style::default().fg(color_muted()),
+                )]));
+            }
         } else {
+            let wait_secs = self
+                .next_discovery_at
+                .map(|next| next.saturating_duration_since(Instant::now()).as_secs())
+                .unwrap_or(0);
             discovery_lines.push(Line::from(Span::styled(
-                "Waiting for next auto scan cycle...",
+                format!("Waiting for next scan cycle... ({wait_secs}s)"),
                 Style::default().fg(color_muted()),
             )));
         }
@@ -656,7 +695,7 @@ impl App {
         }
         discovered_lines.push(Line::default());
         discovered_lines.push(Line::from(Span::styled(
-            "Up/Down select stream, Ctrl+Enter toggle, Tab switch to auth",
+            "Up/Down select stream, Enter toggle, Tab switch to auth",
             Style::default().fg(color_muted()),
         )));
 
@@ -747,8 +786,11 @@ impl App {
             .wrap(Wrap { trim: false });
         frame.render_widget(auth_panel, layout[2]);
 
-        let footer_spans =
-            action_hint_spans(&[("Tab", "Switch Panel"), ("Ctrl+B", "Back to View Streams")]);
+        let footer_spans = action_hint_spans(&[
+            ("Ctrl+L", "Toggle Discovery"),
+            ("Tab", "Switch Panel"),
+            ("Ctrl+B", "Back to View Streams"),
+        ]);
         let footer = Paragraph::new(Line::from(footer_spans))
             .style(Style::default().fg(color_text()))
             .block(panel_block("⌘", "Actions", false));
@@ -758,6 +800,22 @@ impl App {
     fn handle_key(&mut self, key: KeyEvent) -> Result<AppCommand> {
         if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('q')) {
             return Ok(AppCommand::Quit);
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('l')) {
+            self.discovery_enabled = !self.discovery_enabled;
+            if self.discovery_enabled {
+                self.status = "Discovery resumed.".to_owned();
+                self.next_discovery_at = Some(Instant::now());
+            } else {
+                self.status = "Discovery paused.".to_owned();
+                if let Some(handle) = self.pending_discovery.take() {
+                    handle.abort();
+                }
+                self.pending_discovery_events_rx = None;
+                self.discovery_started_at = None;
+                self.discovery_progress = discovery::DiscoveryProgress::default();
+            }
+            return Ok(AppCommand::None);
         }
 
         match self.screen {
@@ -771,6 +829,7 @@ impl App {
             KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.screen = Screen::Settings;
                 self.focus = SettingsFocus::List;
+                self.next_discovery_at = Some(Instant::now());
                 AppCommand::None
             }
             _ => AppCommand::None,
@@ -814,7 +873,10 @@ impl App {
                         (self.discovered_cursor + 1).min(self.discovered.len() - 1);
                 }
             }
-            KeyCode::Enter if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Enter => {
+                self.toggle_current_selection();
+            }
+            KeyCode::Char(' ') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.toggle_current_selection();
             }
             _ => {}
@@ -846,38 +908,44 @@ impl App {
             _ => {}
         }
 
-        let Some(selected) = self.current_selected_stream_mut() else {
+        let Some(selected_index) = self.current_selected_stream_index() else {
             self.status = "Select a discovered camera checkbox first.".to_owned();
             return Ok(AppCommand::None);
         };
-        let target_base_url = selected.base_url.clone();
+        let target_base_url = self.selected_streams[selected_index].base_url.clone();
 
-        match field {
-            AuthField::DisplayName => {
-                let value = selected.display_name.get_or_insert_with(String::new);
-                edit_text_field(value, key, true)?;
-                if value.trim().is_empty() {
-                    selected.display_name = None;
+        {
+            let selected = &mut self.selected_streams[selected_index];
+            match field {
+                AuthField::DisplayName => {
+                    let value = selected.display_name.get_or_insert_with(String::new);
+                    edit_text_field(value, key, true)?;
+                    if value.trim().is_empty() {
+                        selected.display_name = None;
+                    }
                 }
-            }
-            AuthField::Username => {
-                let value = selected.username.get_or_insert_with(String::new);
-                edit_text_field(value, key, true)?;
-                if value.trim().is_empty() {
-                    selected.username = None;
+                AuthField::Username => {
+                    let value = selected.username.get_or_insert_with(String::new);
+                    edit_text_field(value, key, true)?;
+                    if value.trim().is_empty() {
+                        selected.username = None;
+                    }
                 }
-            }
-            AuthField::Password => {
-                let value = selected.password.get_or_insert_with(String::new);
-                edit_text_field(value, key, true)?;
-                if value.trim().is_empty() {
-                    selected.password = None;
+                AuthField::Password => {
+                    let value = selected.password.get_or_insert_with(String::new);
+                    edit_text_field(value, key, true)?;
+                    if value.trim().is_empty() {
+                        selected.password = None;
+                    }
                 }
             }
         }
+        self.propagate_camera_profile(selected_index);
+
+        let target_label = camera_auth_key(&target_base_url).unwrap_or(target_base_url.clone());
 
         if self.persist_selection() {
-            self.auth_notice = format!("Saved credentials for {}.", target_base_url);
+            self.auth_notice = format!("Saved credentials for {}.", target_label);
             self.status = "Auth saved.".to_owned();
             // Force worker refresh even if URL comparison would otherwise look unchanged.
             self.live_stream_specs.clear();
@@ -888,20 +956,56 @@ impl App {
     fn apply_discovery_result(&mut self, result: Result<Vec<DiscoveredStream>>) {
         match result {
             Ok(discovered) => {
-                let discovered = dedupe_discovered_streams_by_url(discovered);
-                self.discovered = sanitize_discovered(discovered.clone());
-                self.discovered_cursor = self
-                    .discovered_cursor
-                    .min(self.discovered.len().saturating_sub(1));
+                self.discovered_cache = dedupe_discovered_streams_by_url(discovered);
+                self.refresh_discovered_view_preserving_cursor();
                 self.status = format!("Discovered {} stream endpoint(s)", self.discovered.len());
                 let _ = cache::save_cache(&DiscoveryCache {
-                    streams: discovered,
+                    streams: self.discovered_cache.clone(),
                 });
+                self.next_discovery_at = Some(Instant::now() + DISCOVERY_RESCAN_INTERVAL);
             }
             Err(err) => {
                 self.status = format!("Discovery failed: {err:#}");
+                self.next_discovery_at = Some(Instant::now() + DISCOVERY_RETRY_INTERVAL);
             }
         }
+    }
+
+    fn merge_discovered_stream(&mut self, stream: DiscoveredStream) {
+        self.discovered_cache.push(stream);
+        self.discovered_cache =
+            dedupe_discovered_streams_by_url(std::mem::take(&mut self.discovered_cache));
+        self.refresh_discovered_view_preserving_cursor();
+        self.status = format!("Discovering... {} endpoint(s) found", self.discovered.len());
+        let _ = cache::save_cache(&DiscoveryCache {
+            streams: self.discovered_cache.clone(),
+        });
+    }
+
+    fn refresh_discovered_view_preserving_cursor(&mut self) {
+        let previous_base_url = self
+            .discovered
+            .get(self.discovered_cursor)
+            .map(|item| item.base_url.clone());
+        self.discovered = sanitize_discovered(self.discovered_cache.clone());
+        if self.discovered.is_empty() {
+            self.discovered_cursor = 0;
+            return;
+        }
+
+        if let Some(base_url) = previous_base_url
+            && let Some(index) = self
+                .discovered
+                .iter()
+                .position(|item| item.base_url == base_url)
+        {
+            self.discovered_cursor = index;
+            return;
+        }
+
+        self.discovered_cursor = self
+            .discovered_cursor
+            .min(self.discovered.len().saturating_sub(1));
     }
 
     fn start_discovery(&mut self, args: DiscoverArgs) {
@@ -910,11 +1014,64 @@ impl App {
             return;
         }
 
-        self.status = "Running discovery... (you can still navigate UI)".to_owned();
+        self.status = "Running discovery...".to_owned();
         self.discovery_started_at = Some(Instant::now());
+        self.discovery_progress = discovery::DiscoveryProgress::default();
+        let (event_tx, event_rx) = tokio_mpsc::unbounded_channel();
+        self.pending_discovery_events_rx = Some(event_rx);
         self.pending_discovery = Some(tokio::spawn(async move {
-            discovery::discover_streams(&args).await
+            discovery::discover_streams_with_events(&args, Some(event_tx)).await
         }));
+    }
+
+    fn sync_discovery_lifecycle(&mut self) {
+        if !self.discovery_enabled || self.screen != Screen::Settings {
+            if let Some(handle) = self.pending_discovery.take() {
+                handle.abort();
+            }
+            self.pending_discovery_events_rx = None;
+            self.discovery_started_at = None;
+            self.discovery_progress = discovery::DiscoveryProgress::default();
+            return;
+        }
+
+        if self.pending_discovery.is_some() {
+            return;
+        }
+
+        let should_start = self
+            .next_discovery_at
+            .is_none_or(|next| Instant::now() >= next);
+        if should_start {
+            self.start_discovery(self.discovery_args());
+            self.next_discovery_at = None;
+        }
+    }
+
+    fn poll_discovery_events(&mut self) {
+        let Some(rx) = self.pending_discovery_events_rx.as_mut() else {
+            return;
+        };
+
+        let mut found = Vec::new();
+        loop {
+            match rx.try_recv() {
+                Ok(discovery::DiscoveryEvent::Progress(progress)) => {
+                    self.discovery_progress = progress;
+                }
+                Ok(discovery::DiscoveryEvent::StreamFound(stream)) => {
+                    found.push(stream);
+                }
+                Err(tokio_mpsc::error::TryRecvError::Empty) => break,
+                Err(tokio_mpsc::error::TryRecvError::Disconnected) => {
+                    self.pending_discovery_events_rx = None;
+                    break;
+                }
+            }
+        }
+        for stream in found {
+            self.merge_discovered_stream(stream);
+        }
     }
 
     async fn poll_discovery_result(&mut self) {
@@ -932,14 +1089,20 @@ impl App {
             Err(err) => Err(anyhow!("discovery task failed: {err}")),
         };
         self.discovery_started_at = None;
+        self.pending_discovery_events_rx = None;
+        self.discovery_progress.completed = self.discovery_progress.total;
         self.apply_discovery_result(result);
     }
 
     fn selected_live_stream_specs(&self) -> Vec<LiveStreamSpec> {
         let mut streams = Vec::with_capacity(self.selected_streams.len());
         for stream in self.selected_streams.iter().filter(|stream| stream.enabled) {
-            let stream_username = stream.username.as_deref().unwrap_or("").trim();
-            let username = stream_username;
+            let username_raw = stream.username.as_deref().unwrap_or("");
+            let username = if username_raw.trim().is_empty() {
+                ""
+            } else {
+                username_raw
+            };
             let password = stream.password.as_deref().unwrap_or("");
             let url = apply_rtsp_credentials(&stream.base_url, username, password)
                 .unwrap_or_else(|_| stream.base_url.clone());
@@ -1273,42 +1436,36 @@ impl App {
         Ok(())
     }
 
-    fn discovery_phase_text(&self) -> &'static str {
-        let elapsed = self
-            .discovery_started_at
-            .map_or(0.0, |start| start.elapsed().as_secs_f32());
-
-        if elapsed < 1.8 {
-            "Discovering: resolving local network ranges"
-        } else if self.discovery_form.onvif && elapsed < 4.2 {
-            "Discovering: probing ONVIF WS-Discovery hosts"
-        } else if elapsed < 9.0 {
-            "Discovering: probing RTSP endpoints (DESCRIBE)"
-        } else {
-            "Discovering: collecting and deduplicating results"
+    fn discovery_phase_text(&self) -> String {
+        if self.discovery_progress.total == 0 {
+            return "Discovering: preparing probe targets".to_owned();
         }
+        "Discovering: probing RTSP endpoints (DESCRIBE)".to_owned()
     }
 
     fn discovery_loading_bar(&self, width: usize) -> String {
         let width = width.max(12);
-        let pulse_width = (width / 4).max(3);
-        let period = (width + pulse_width).max(1);
-        let head = usize::try_from(self.ui_tick).unwrap_or(usize::MAX) % period;
+        let total = self.discovery_progress.total.max(1);
+        let completed = self.discovery_progress.completed.min(total);
+        let filled = completed.saturating_mul(width) / total;
 
         let mut bar = String::with_capacity(width + 2);
         bar.push('[');
         for idx in 0..width {
-            if idx + pulse_width >= head && idx <= head {
+            if idx < filled {
                 bar.push('=');
             } else {
                 bar.push('-');
             }
         }
-        if head < width {
-            let replace_at = 1 + head;
-            bar.replace_range(replace_at..=replace_at, ">");
-        }
         bar.push(']');
+        let pct = if self.discovery_progress.total == 0 {
+            0.0
+        } else {
+            (completed as f32 * 100.0) / self.discovery_progress.total as f32
+        };
+        bar.push(' ');
+        bar.push_str(&format!("{pct:>5.1}%"));
         bar
     }
 
@@ -1334,7 +1491,7 @@ impl App {
     }
 
     fn toggle_current_selection(&mut self) {
-        let Some(item) = self.discovered.get(self.discovered_cursor) else {
+        let Some(item) = self.discovered.get(self.discovered_cursor).cloned() else {
             return;
         };
 
@@ -1351,14 +1508,23 @@ impl App {
                 "Camera endpoint removed from View Streams".to_owned()
             };
         } else {
+            let inherited = inherited_camera_profile(&self.selected_streams, &item.base_url);
+            let inherited_auth = inherited
+                .as_ref()
+                .and_then(|stream| stream.username.as_deref())
+                .is_some_and(|name| !name.trim().is_empty());
             self.selected_streams.push(SelectedStream {
                 base_url: item.base_url.clone(),
                 enabled: true,
-                username: None,
-                password: None,
-                display_name: None,
+                username: inherited.as_ref().and_then(|stream| stream.username.clone()),
+                password: inherited.as_ref().and_then(|stream| stream.password.clone()),
+                display_name: inherited.and_then(|stream| stream.display_name.clone()),
             });
-            self.status = "Camera endpoint added to View Streams".to_owned();
+            self.status = if inherited_auth {
+                "Camera endpoint added to View Streams (reused camera auth).".to_owned()
+            } else {
+                "Camera endpoint added to View Streams".to_owned()
+            };
         }
         self.selected_streams =
             dedupe_selected_streams_by_url(std::mem::take(&mut self.selected_streams));
@@ -1366,11 +1532,11 @@ impl App {
         let _ = self.persist_selection();
     }
 
-    fn current_selected_stream_mut(&mut self) -> Option<&mut SelectedStream> {
+    fn current_selected_stream_index(&self) -> Option<usize> {
         let item = self.discovered.get(self.discovered_cursor)?;
         self.selected_streams
-            .iter_mut()
-            .find(|stream| stream.base_url == item.base_url && stream.enabled)
+            .iter()
+            .position(|stream| stream.base_url == item.base_url && stream.enabled)
     }
 
     fn current_selected_auth(&self) -> Option<(String, String, String, String)> {
@@ -1403,6 +1569,27 @@ impl App {
                 self.status = format!("Failed saving selection: {err:#}");
                 false
             }
+        }
+    }
+
+    fn propagate_camera_profile(&mut self, source_index: usize) {
+        let Some(source) = self.selected_streams.get(source_index).cloned() else {
+            return;
+        };
+        let Some(source_key) = camera_auth_key(&source.base_url) else {
+            return;
+        };
+
+        for (idx, stream) in self.selected_streams.iter_mut().enumerate() {
+            if idx == source_index {
+                continue;
+            }
+            if camera_auth_key(&stream.base_url).as_deref() != Some(source_key.as_str()) {
+                continue;
+            }
+            stream.display_name = source.display_name.clone();
+            stream.username = source.username.clone();
+            stream.password = source.password.clone();
         }
     }
 }
@@ -1576,8 +1763,9 @@ async fn run_embedded_stream_session(
     geometry_rx: watch::Receiver<RenderGeometry>,
     decode_tx: &SyncSender<DecodeJob>,
 ) -> Result<()> {
-    let mut parsed =
+    let parsed_with_auth =
         Url::parse(&stream_url).with_context(|| format!("invalid RTSP URL: {stream_url}"))?;
+    let mut parsed = parsed_with_auth.clone();
 
     let creds = extract_credentials(&parsed);
     if !parsed.username().is_empty() {
@@ -1596,9 +1784,25 @@ async fn run_embedded_stream_session(
         session_options = session_options.creds(Some(credentials));
     }
 
-    let mut session = Session::describe(parsed, session_options)
-        .await
-        .context("RTSP DESCRIBE failed")?;
+    let mut session = match Session::describe(parsed.clone(), session_options).await {
+        Ok(session) => session,
+        Err(primary_err) => {
+            // Some cameras accept credentials only when embedded in the RTSP URL.
+            // Retry once with URL userinfo preserved before surfacing failure.
+            if parsed_with_auth.username().is_empty() {
+                return Err(primary_err).context("RTSP DESCRIBE failed");
+            }
+
+            match Session::describe(parsed_with_auth, SessionOptions::default()).await {
+                Ok(session) => session,
+                Err(fallback_err) => {
+                    return Err(anyhow!(
+                        "RTSP DESCRIBE failed (session creds): {primary_err:#}; fallback failed (URL creds): {fallback_err:#}"
+                    ));
+                }
+            }
+        }
+    };
 
     let stream_index = pick_h264_stream(&session)?;
     session
@@ -1788,8 +1992,8 @@ fn extract_credentials(parsed: &Url) -> Option<Credentials> {
     }
 
     Some(Credentials {
-        username: parsed.username().to_owned(),
-        password: parsed.password().unwrap_or("").to_owned(),
+        username: percent_decode_userinfo(parsed.username()),
+        password: percent_decode_userinfo(parsed.password().unwrap_or("")),
     })
 }
 
@@ -2505,6 +2709,34 @@ fn camera_ip_key(url: &str) -> Option<String> {
     Some(host.to_owned())
 }
 
+fn camera_auth_key(url: &str) -> Option<String> {
+    let parsed = Url::parse(url).ok()?;
+    let host = parsed.host_str()?;
+    let port = parsed.port_or_known_default().unwrap_or(554);
+    Some(format!("{host}:{port}"))
+}
+
+fn inherited_camera_profile(streams: &[SelectedStream], base_url: &str) -> Option<SelectedStream> {
+    let target_key = camera_auth_key(base_url)?;
+    streams
+        .iter()
+        .find(|candidate| {
+            if camera_auth_key(&candidate.base_url).as_deref() != Some(target_key.as_str()) {
+                return false;
+            }
+            candidate
+                .username
+                .as_deref()
+                .is_some_and(|name| !name.trim().is_empty())
+                || candidate.password.as_deref().is_some_and(|pass| !pass.is_empty())
+                || candidate
+                    .display_name
+                    .as_deref()
+                    .is_some_and(|name| !name.trim().is_empty())
+        })
+        .cloned()
+}
+
 fn dedupe_selected_streams_by_url(streams: Vec<SelectedStream>) -> Vec<SelectedStream> {
     let mut deduped: Vec<SelectedStream> = Vec::new();
     for stream in streams {
@@ -2636,6 +2868,36 @@ fn percent_encode_userinfo(value: &str) -> String {
         }
     }
     encoded
+}
+
+fn percent_decode_userinfo(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut idx = 0;
+
+    while idx < bytes.len() {
+        if bytes[idx] == b'%' && idx + 2 < bytes.len()
+            && let (Some(hi), Some(lo)) = (hex_value(bytes[idx + 1]), hex_value(bytes[idx + 2]))
+        {
+            decoded.push((hi << 4) | lo);
+            idx += 3;
+            continue;
+        }
+
+        decoded.push(bytes[idx]);
+        idx += 1;
+    }
+
+    String::from_utf8_lossy(&decoded).into_owned()
+}
+
+const fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn edit_text_field(target: &mut String, key: KeyEvent, allow_spaces: bool) -> Result<AppCommand> {

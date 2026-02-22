@@ -10,13 +10,32 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, mpsc};
 
 const STATUS_OK: u16 = 200;
 const STATUS_UNAUTHORIZED: u16 = 401;
 const USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
 
 pub async fn discover_streams(args: &DiscoverArgs) -> Result<Vec<DiscoveredStream>> {
+    discover_streams_with_events(args, None).await
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DiscoveryProgress {
+    pub completed: usize,
+    pub total: usize,
+}
+
+#[derive(Debug, Clone)]
+pub enum DiscoveryEvent {
+    Progress(DiscoveryProgress),
+    StreamFound(DiscoveredStream),
+}
+
+pub async fn discover_streams_with_events(
+    args: &DiscoverArgs,
+    event_tx: Option<mpsc::UnboundedSender<DiscoveryEvent>>,
+) -> Result<Vec<DiscoveredStream>> {
     let cidrs = resolve_target_cidrs(args)?;
     let onvif_hosts = if args.onvif {
         match onvif::discover_hosts(Duration::from_millis(args.timeout_ms.max(200))).await {
@@ -68,6 +87,14 @@ pub async fn discover_streams(args: &DiscoverArgs) -> Result<Vec<DiscoveredStrea
         }
     }
 
+    let total_targets = targets.len();
+    if let Some(tx) = event_tx.as_ref() {
+        let _ = tx.send(DiscoveryEvent::Progress(DiscoveryProgress {
+            completed: 0,
+            total: total_targets,
+        }));
+    }
+
     let semaphore = Arc::new(Semaphore::new(args.concurrency.max(1)));
     let auth = Arc::new(ProbeAuth {
         username: args.username.clone(),
@@ -90,12 +117,24 @@ pub async fn discover_streams(args: &DiscoverArgs) -> Result<Vec<DiscoveredStrea
 
     let mut seen = HashSet::new();
     let mut discovered = Vec::new();
+    let mut completed = 0_usize;
     while let Some(joined) = join_set.join_next().await {
         let maybe_stream = joined.context("discovery worker task failed")?;
-        if let Some(stream) = maybe_stream
-            && seen.insert(stream.url.clone())
-        {
-            discovered.push(stream);
+        completed = completed.saturating_add(1);
+        if let Some(tx) = event_tx.as_ref() {
+            let _ = tx.send(DiscoveryEvent::Progress(DiscoveryProgress {
+                completed,
+                total: total_targets,
+            }));
+        }
+
+        if let Some(stream) = maybe_stream {
+            if seen.insert(stream.url.clone()) {
+                discovered.push(stream.clone());
+                if let Some(tx) = event_tx.as_ref() {
+                    let _ = tx.send(DiscoveryEvent::StreamFound(stream));
+                }
+            }
         }
     }
 
