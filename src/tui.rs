@@ -656,7 +656,7 @@ impl App {
         }
         discovered_lines.push(Line::default());
         discovered_lines.push(Line::from(Span::styled(
-            "Up/Down select stream, Ctrl+Space toggle, Tab switch to auth",
+            "Up/Down select stream, Ctrl+Enter toggle, Tab switch to auth",
             Style::default().fg(color_muted()),
         )));
 
@@ -814,7 +814,7 @@ impl App {
                         (self.discovered_cursor + 1).min(self.discovered.len() - 1);
                 }
             }
-            KeyCode::Char(' ') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Enter if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.toggle_current_selection();
             }
             _ => {}
