@@ -3,6 +3,13 @@ name = "rtsp-tui"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.86"
+description = "High-performance terminal RTSP camera viewer with discovery and multi-stream TUI"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/Ty1an/RTSP-TUI"
+homepage = "https://github.com/Ty1an/RTSP-TUI"
+keywords = ["rtsp", "tui", "camera", "terminal", "video"]
+exclude = ["SKILL.MD", ".DS_Store", "target/*"]
 
 [lints.rust]
 unsafe_code = "warn"

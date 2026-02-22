@@ -189,22 +189,6 @@ impl KittyUploadState {
         });
         Ok(())
     }
-
-    fn reset_frame_cache(&mut self) {
-        self.encoded_seq = u64::MAX;
-        self.encoded_payload.clear();
-        self.delta_rgb.clear();
-        self.previous_rgb.clear();
-        self.previous_width = 0;
-        self.previous_height = 0;
-        self.next_upload_at = None;
-        self.row = 0;
-        self.col = 0;
-        self.cell_cols = 0;
-        self.cell_rows = 0;
-        self.frame_width = 0;
-        self.frame_height = 0;
-    }
 }
 
 enum DecodeJob {
@@ -349,10 +333,7 @@ struct App {
     live_geometry_tx: Option<watch::Sender<RenderGeometry>>,
     kitty_graphics_enabled: bool,
     kitty_transfer_mode: KittyTransferMode,
-    duplicate_views_enabled: bool,
-    delta_updates_enabled: bool,
     kitty_images_drawn: bool,
-    pending_kitty_clear: bool,
     kitty_upload_states: Vec<KittyUploadState>,
 }
 
@@ -423,19 +404,8 @@ impl App {
             live_geometry_tx: None,
             kitty_graphics_enabled: detect_kitty_graphics_support(),
             kitty_transfer_mode: detect_kitty_transfer_mode(),
-            duplicate_views_enabled: false,
-            delta_updates_enabled: true,
             kitty_images_drawn: false,
-            pending_kitty_clear: false,
             kitty_upload_states: Vec::new(),
-        }
-    }
-
-    fn view_tile_count(&self) -> usize {
-        if self.duplicate_views_enabled && !self.live_tiles.is_empty() {
-            self.live_tiles.len().saturating_mul(2)
-        } else {
-            self.live_tiles.len()
         }
     }
 
@@ -534,34 +504,7 @@ impl App {
                     .block(panel_block("◉", "Live Viewer", true))
                     .wrap(Wrap { trim: false });
                 frame.render_widget(panel, viewer_area);
-                let mut footer_spans = action_hint_spans(&[
-                    ("Ctrl+D", "Delta Toggle"),
-                    ("Ctrl+U", "Dup Views"),
-                    ("Ctrl+S", "Settings"),
-                    ("Ctrl+Q", "Quit"),
-                ]);
-                footer_spans.push(Span::styled(
-                    format!(
-                        "  delta {}",
-                        if self.delta_updates_enabled {
-                            "on"
-                        } else {
-                            "off"
-                        }
-                    ),
-                    Style::default().fg(color_muted()),
-                ));
-                footer_spans.push(Span::styled(
-                    format!(
-                        "  dup {}",
-                        if self.duplicate_views_enabled {
-                            "on"
-                        } else {
-                            "off"
-                        }
-                    ),
-                    Style::default().fg(color_muted()),
-                ));
+                let footer_spans = action_hint_spans(&[("Ctrl+S", "Settings"), ("Ctrl+Q", "Quit")]);
                 let footer = Paragraph::new(Line::from(footer_spans))
                     .style(Style::default().fg(color_text()))
                     .block(panel_block("⌘", "Actions", false));
@@ -570,7 +513,7 @@ impl App {
             }
 
             let (aspect_w, aspect_h) = target_video_aspect_in_cells();
-            let view_count = self.view_tile_count();
+            let view_count = self.live_tiles.len();
             let (rows, cols) = compute_grid_dimensions(view_count, viewer_area, aspect_w, aspect_h);
             let grid_rects =
                 build_grid_rects_for_aspect(viewer_area, rows, cols, aspect_w, aspect_h);
@@ -579,8 +522,7 @@ impl App {
                 if idx >= grid_rects.len() {
                     break;
                 }
-                let source_idx = idx % self.live_tiles.len();
-                let tile = &self.live_tiles[source_idx];
+                let tile = &self.live_tiles[idx];
 
                 let area = grid_rects[idx];
                 let snapshot = tile.inner.read();
@@ -599,10 +541,7 @@ impl App {
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(
-                        format!(
-                            "  fps {:.1}  net {:.1} kbps",
-                            snapshot.upload_fps, snapshot.network_kbps
-                        ),
+                        format!("  net {:.1} kbps", snapshot.network_kbps),
                         Style::default().fg(color_muted()),
                     ),
                 ]);
@@ -620,38 +559,7 @@ impl App {
             }
         }
 
-        let mut footer_spans = action_hint_spans(&[
-            ("Ctrl+D", "Delta Toggle"),
-            ("Ctrl+U", "Dup Views"),
-            ("Ctrl+S", "Settings"),
-            ("Ctrl+Q", "Quit"),
-        ]);
-        footer_spans.push(Span::styled(
-            format!(
-                "  delta {}",
-                if self.delta_updates_enabled {
-                    "on"
-                } else {
-                    "off"
-                }
-            ),
-            Style::default().fg(color_muted()),
-        ));
-        footer_spans.push(Span::styled(
-            format!(
-                "  dup {}",
-                if self.duplicate_views_enabled {
-                    "on"
-                } else {
-                    "off"
-                }
-            ),
-            Style::default().fg(color_muted()),
-        ));
-        footer_spans.push(Span::styled(
-            format!("  target {LIVE_TARGET_FPS}fps"),
-            Style::default().fg(color_muted()),
-        ));
+        let footer_spans = action_hint_spans(&[("Ctrl+S", "Settings"), ("Ctrl+Q", "Quit")]);
         let footer = Paragraph::new(Line::from(footer_spans))
             .style(Style::default().fg(color_text()))
             .block(panel_block("⌘", "Actions", false));
@@ -860,39 +768,6 @@ impl App {
 
     fn handle_view_streams_key(&mut self, key: KeyEvent) -> AppCommand {
         match key.code {
-            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.delta_updates_enabled = !self.delta_updates_enabled;
-                for state in &mut self.kitty_upload_states {
-                    state.reset_frame_cache();
-                }
-                self.status = format!(
-                    "Delta updates {} for all streams.",
-                    if self.delta_updates_enabled {
-                        "enabled"
-                    } else {
-                        "disabled"
-                    }
-                );
-                AppCommand::None
-            }
-            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                let base_count = self.live_tiles.len();
-                self.duplicate_views_enabled = !self.duplicate_views_enabled;
-                let total_count = self.view_tile_count();
-                self.pending_kitty_clear = true;
-                self.kitty_upload_states.clear();
-                self.status = format!(
-                    "Duplicate views {} ({} -> {}).",
-                    if self.duplicate_views_enabled {
-                        "enabled"
-                    } else {
-                        "disabled"
-                    },
-                    base_count,
-                    total_count
-                );
-                AppCommand::None
-            }
             KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.screen = Screen::Settings;
                 self.focus = SettingsFocus::List;
@@ -1139,11 +1014,6 @@ impl App {
             }
             return Ok(());
         }
-        if self.pending_kitty_clear {
-            self.clear_kitty_images(terminal)?;
-            self.pending_kitty_clear = false;
-        }
-
         let area = terminal
             .size()
             .context("failed to read terminal size for graphics")?;
@@ -1152,7 +1022,7 @@ impl App {
             .constraints([Constraint::Min(8), Constraint::Length(3)])
             .split(area.into());
         let viewer_area = layout[0];
-        let view_count = self.view_tile_count();
+        let view_count = self.live_tiles.len();
         let (aspect_w, aspect_h) = target_video_aspect_in_cells();
         let (rows, cols) = compute_grid_dimensions(view_count, viewer_area, aspect_w, aspect_h);
         let grid_rects = build_grid_rects_for_aspect(viewer_area, rows, cols, aspect_w, aspect_h);
@@ -1177,13 +1047,11 @@ impl App {
         let upload_pacing_enabled = true;
         let upload_interval = Duration::from_millis(1_000_u64 / u64::from(LIVE_TARGET_FPS.max(1)));
         let stream_count = view_count.max(1);
-        let mut upload_recorded = vec![false; self.live_tiles.len()];
         for idx in 0..view_count {
             if idx >= grid_rects.len() {
                 break;
             }
-            let source_idx = idx % self.live_tiles.len();
-            let tile = &self.live_tiles[source_idx];
+            let tile = &self.live_tiles[idx];
 
             let inner = inner_cell(grid_rects[idx]);
             if inner.width < 2 || inner.height < 2 {
@@ -1208,7 +1076,7 @@ impl App {
             let frame_width = snapshot.frame_width;
             let frame_height = snapshot.frame_height;
             let frame_changed = upload_state.encoded_seq != frame_seq;
-            let previous_rgb = if self.delta_updates_enabled && frame_changed {
+            let previous_rgb = if frame_changed {
                 Some(snapshot.frame_rgb.clone())
             } else {
                 None
@@ -1239,8 +1107,7 @@ impl App {
                 }
             }
 
-            let can_try_delta = self.delta_updates_enabled
-                && frame_changed
+            let can_try_delta = frame_changed
                 && !placement_changed
                 && upload_state.previous_width == frame_width
                 && upload_state.previous_height == frame_height
@@ -1368,22 +1235,11 @@ impl App {
             } else {
                 write_kitty_chunked(backend, &control, &upload_state.encoded_payload, None)?;
             }
-            if !upload_recorded[source_idx] {
-                tile.record_upload();
-                upload_recorded[source_idx] = true;
-            }
-
             upload_state.encoded_seq = frame_seq;
-            if self.delta_updates_enabled {
-                if let Some(previous_rgb) = previous_rgb {
-                    upload_state.previous_rgb = previous_rgb;
-                    upload_state.previous_width = frame_width;
-                    upload_state.previous_height = frame_height;
-                }
-            } else {
-                upload_state.previous_rgb.clear();
-                upload_state.previous_width = 0;
-                upload_state.previous_height = 0;
+            if let Some(previous_rgb) = previous_rgb {
+                upload_state.previous_rgb = previous_rgb;
+                upload_state.previous_width = frame_width;
+                upload_state.previous_height = frame_height;
             }
             upload_state.row = row;
             upload_state.col = col;
@@ -1558,9 +1414,6 @@ struct EmbeddedTileSnapshot {
     frame_height: usize,
     frame_seq: u64,
     status: String,
-    upload_fps: f32,
-    upload_window_started_at: Instant,
-    upload_window_frames: u32,
     network_kbps: f32,
     network_window_started_at: Instant,
     network_window_bytes: u64,
@@ -1577,9 +1430,6 @@ impl EmbeddedTileSnapshot {
             frame_height: 0,
             frame_seq: 0,
             status: "connecting".to_owned(),
-            upload_fps: 0.0,
-            upload_window_started_at: now,
-            upload_window_frames: 0,
             network_kbps: 0.0,
             network_window_started_at: now,
             network_window_bytes: 0,
@@ -1623,19 +1473,6 @@ impl EmbeddedTileState {
             snapshot.network_kbps = (snapshot.network_window_bytes as f32 * 8.0) / (secs * 1_000.0);
             snapshot.network_window_started_at = now;
             snapshot.network_window_bytes = 0;
-        }
-    }
-
-    fn record_upload(&self) {
-        let now = Instant::now();
-        let mut snapshot = self.inner.write();
-        snapshot.upload_window_frames = snapshot.upload_window_frames.saturating_add(1);
-        let elapsed = now.saturating_duration_since(snapshot.upload_window_started_at);
-        if elapsed >= Duration::from_millis(500) {
-            let secs = elapsed.as_secs_f32().max(0.001);
-            snapshot.upload_fps = snapshot.upload_window_frames as f32 / secs;
-            snapshot.upload_window_started_at = now;
-            snapshot.upload_window_frames = 0;
         }
     }
 
