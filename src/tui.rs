@@ -33,8 +33,7 @@ use retina::client::{
 };
 use retina::codec::{CodecItem, ParametersRef};
 use std::fs::{self, File, OpenOptions};
-use std::io;
-use std::io::{Seek, SeekFrom, Write};
+use std::io::{self, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::{Arc, OnceLock};

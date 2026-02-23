@@ -6,9 +6,10 @@ A live multi-camera TUI with Kitty graphics rendering.
 
 ## Screenshot
 
-![RTSP-TUI live multi-camera view](<RTSP-TUI EXAMPLE 1.png>)
+![RTSP-TUI live multi-camera view](<screenshots/RTSP-TUI EXAMPLE 1.png>)
+![RTSP-TUI live multi-camera view (alt)](<screenshots/Screenshot 2RTSP-TUI EXAMPLE 2.png>)
 
-<sub><em>AI image replacement for the individual feeds, since I am not sharing real camera footage of my house.</em></sub>
+<sub><em>AI image replacement for the individual feeds, since I am not sharing real camera footage of my house lol.</em></sub>
 
 ## What It Is
 
@@ -23,6 +24,7 @@ The main workflow is:
 - Rust toolchain
 - A terminal with Kitty graphics protocol support (Kitty or Ghostty).
 - Reachable RTSP cameras/streams.
+- Tested Personally on MacOS (M3 Mac) will likely work on Linux or Windwos WSL but no garantee
 
 ## Install
 
