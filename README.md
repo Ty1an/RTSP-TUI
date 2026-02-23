@@ -4,6 +4,12 @@ RTSP-TUI is a terminal-first RTSP camera viewer built in Rust.
 
 A live multi-camera TUI with Kitty graphics rendering.
 
+## Screenshot
+
+![RTSP-TUI live multi-camera view](<RTSP-TUI EXAMPLE 1.png>)
+
+<sub><em>AI image replacement for the individual feeds, since I am not sharing real camera footage of my house.</em></sub>
+
 ## What It Is
 
 The main workflow is:
