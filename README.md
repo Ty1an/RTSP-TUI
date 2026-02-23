@@ -24,7 +24,7 @@ The main workflow is:
 - Rust toolchain
 - A terminal with Kitty graphics protocol support (Kitty or Ghostty).
 - Reachable RTSP cameras/streams.
-- Tested Personally on MacOS (M3 Mac) will likely work on Linux or Windwos WSL but no garantee
+- Tested Personally on MacOS (M3 Mac) will likely work on Linux or Windows WSL but no guarantee
 
 ## Install
 
