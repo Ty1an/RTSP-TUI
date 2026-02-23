@@ -19,6 +19,11 @@ The main workflow is:
 3. Select streams and set per-camera auth/display names.
 4. Watch live tiles in the viewer.
 
+## Possible Additions
+
+1. Maybe make it like a somewhat lightweight "NVR" with motion detection that saves the last frame or something idk
+2. Make it more accecible for an AI agent (SKILL.MD) like openclaw to automate something based on camera information (Claude watches your house now lol 🙃)
+
 ## Requirements
 
 - Rust toolchain
