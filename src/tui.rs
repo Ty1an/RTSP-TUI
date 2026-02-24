@@ -2991,11 +2991,32 @@ fn write_kitty_chunked(
 }
 
 fn detect_kitty_graphics_support() -> bool {
+    if let Some(explicit) = parse_bool_env("RTSP_CLI_KITTY_GRAPHICS") {
+        return explicit;
+    }
+
     let term = std::env::var("TERM").unwrap_or_default().to_lowercase();
     let term_program = std::env::var("TERM_PROGRAM")
         .unwrap_or_default()
         .to_lowercase();
-    term.contains("kitty") || term_program.contains("ghostty")
+
+    // TERM and TERM_PROGRAM cover known values used by terminals that implement Kitty graphics.
+    if term_or_program_indicates_kitty_graphics(&term, &term_program) {
+        return true;
+    }
+
+    // Additional environment markers for terminals that often keep TERM as xterm-256color.
+    [
+        "KITTY_WINDOW_ID",
+        "KITTY_PID",
+        "WEZTERM_EXECUTABLE",
+        "WEZTERM_PANE",
+        "GHOSTTY_RESOURCES_DIR",
+        "KONSOLE_VERSION",
+        "KONSOLE_PROFILE_NAME",
+    ]
+    .into_iter()
+    .any(|name| std::env::var_os(name).is_some())
 }
 
 fn detect_kitty_transfer_mode() -> KittyTransferMode {
@@ -3012,6 +3033,38 @@ fn detect_kitty_transfer_mode() -> KittyTransferMode {
         KittyTransferMode::Stream
     } else {
         KittyTransferMode::File
+    }
+}
+
+fn term_or_program_indicates_kitty_graphics(term: &str, term_program: &str) -> bool {
+    let term = term.to_ascii_lowercase();
+    let term_program = term_program.to_ascii_lowercase();
+
+    [
+        "kitty",
+        "ghostty",
+        "wezterm",
+        "foot",
+        "foot-extra",
+        "konsole",
+    ]
+    .into_iter()
+    .any(|hint| term.contains(hint))
+        || ["ghostty", "wezterm", "konsole"]
+            .into_iter()
+            .any(|hint| term_program.contains(hint))
+}
+
+fn parse_bool_env(name: &str) -> Option<bool> {
+    let value = std::env::var(name).ok()?;
+    parse_bool_value(&value)
+}
+
+fn parse_bool_value(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" | "enable" | "enabled" => Some(true),
+        "0" | "false" | "no" | "off" | "disable" | "disabled" => Some(false),
+        _ => None,
     }
 }
 
@@ -3142,4 +3195,51 @@ fn checkbox(checked: bool) -> &'static str {
 
 fn focus_marker(focused: bool) -> &'static str {
     if focused { GLYPH_ACTIVE } else { " " }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_bool_value, term_or_program_indicates_kitty_graphics};
+
+    #[test]
+    fn kitty_term_hints_are_detected() {
+        assert!(term_or_program_indicates_kitty_graphics(
+            "xterm-kitty",
+            "unknown"
+        ));
+        assert!(term_or_program_indicates_kitty_graphics("wezterm", "unknown"));
+        assert!(term_or_program_indicates_kitty_graphics("xterm-ghostty", "unknown"));
+        assert!(term_or_program_indicates_kitty_graphics("foot", "unknown"));
+        assert!(term_or_program_indicates_kitty_graphics("foot-extra", "unknown"));
+        assert!(term_or_program_indicates_kitty_graphics("konsole", "unknown"));
+    }
+
+    #[test]
+    fn kitty_term_program_hints_are_detected() {
+        assert!(term_or_program_indicates_kitty_graphics(
+            "xterm-256color",
+            "WezTerm"
+        ));
+        assert!(term_or_program_indicates_kitty_graphics(
+            "xterm-256color",
+            "Ghostty"
+        ));
+        assert!(term_or_program_indicates_kitty_graphics(
+            "xterm-256color",
+            "Konsole"
+        ));
+        assert!(!term_or_program_indicates_kitty_graphics(
+            "xterm-256color",
+            "Apple_Terminal"
+        ));
+    }
+
+    #[test]
+    fn bool_values_parse_as_expected() {
+        assert_eq!(parse_bool_value("1"), Some(true));
+        assert_eq!(parse_bool_value(" enabled "), Some(true));
+        assert_eq!(parse_bool_value("0"), Some(false));
+        assert_eq!(parse_bool_value("disabled"), Some(false));
+        assert_eq!(parse_bool_value("maybe"), None);
+    }
 }

@@ -27,7 +27,7 @@ The main workflow is:
 ## Requirements
 
 - Rust toolchain
-- A terminal with Kitty graphics protocol support (Kitty or Ghostty).
+- A terminal with Kitty graphics protocol support (Kitty, Ghostty, WezTerm, Foot, or Konsole).
 - Reachable RTSP cameras/streams.
 - Tested Personally on MacOS (M3 Mac) will likely work on Linux or Windows WSL but no guarantee
 
