@@ -3028,12 +3028,51 @@ fn detect_kitty_transfer_mode() -> KittyTransferMode {
         }
     }
 
-    // SSH sessions generally do not share a filesystem path namespace with kitty.
-    if std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some() {
-        KittyTransferMode::Stream
-    } else {
-        KittyTransferMode::File
+    let is_ssh = std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some();
+    let has_namespace_isolation = detect_namespace_isolation();
+    let has_native_kitty_session =
+        std::env::var_os("KITTY_WINDOW_ID").is_some() || std::env::var_os("KITTY_PID").is_some();
+    choose_kitty_transfer_mode(is_ssh, has_namespace_isolation, has_native_kitty_session)
+}
+
+fn choose_kitty_transfer_mode(
+    is_ssh: bool,
+    has_namespace_isolation: bool,
+    has_native_kitty_session: bool,
+) -> KittyTransferMode {
+    // Remote and containerized sessions commonly do not share a filesystem namespace with
+    // the terminal GUI process, so kitty file transfer can render as black frames.
+    if is_ssh || has_namespace_isolation {
+        return KittyTransferMode::Stream;
     }
+
+    // Auto mode is conservative: prefer stream unless we're in a native kitty session.
+    if has_native_kitty_session {
+        KittyTransferMode::File
+    } else {
+        KittyTransferMode::Stream
+    }
+}
+
+fn detect_namespace_isolation() -> bool {
+    let env_markers = [
+        "CONTAINER",
+        "FLATPAK_ID",
+        "FLATPAK_SANDBOX_DIR",
+        "TOOLBOX_PATH",
+        "DISTROBOX_ENTER_PATH",
+    ];
+    if env_markers
+        .into_iter()
+        .any(|name| std::env::var_os(name).is_some())
+    {
+        return true;
+    }
+
+    let file_markers = ["/run/.containerenv", "/.dockerenv"];
+    file_markers
+        .into_iter()
+        .any(|path| std::path::Path::new(path).exists())
 }
 
 fn term_or_program_indicates_kitty_graphics(term: &str, term_program: &str) -> bool {
@@ -3199,7 +3238,10 @@ fn focus_marker(focused: bool) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_bool_value, term_or_program_indicates_kitty_graphics};
+    use super::{
+        KittyTransferMode, choose_kitty_transfer_mode, parse_bool_value,
+        term_or_program_indicates_kitty_graphics,
+    };
 
     #[test]
     fn kitty_term_hints_are_detected() {
@@ -3241,5 +3283,33 @@ mod tests {
         assert_eq!(parse_bool_value("0"), Some(false));
         assert_eq!(parse_bool_value("disabled"), Some(false));
         assert_eq!(parse_bool_value("maybe"), None);
+    }
+
+    #[test]
+    fn kitty_transfer_prefers_stream_for_unknown_local_session() {
+        assert_eq!(
+            choose_kitty_transfer_mode(false, false, false),
+            KittyTransferMode::Stream
+        );
+    }
+
+    #[test]
+    fn kitty_transfer_prefers_file_for_native_kitty_session() {
+        assert_eq!(
+            choose_kitty_transfer_mode(false, false, true),
+            KittyTransferMode::File
+        );
+    }
+
+    #[test]
+    fn kitty_transfer_uses_stream_for_ssh_or_container() {
+        assert_eq!(
+            choose_kitty_transfer_mode(true, false, true),
+            KittyTransferMode::Stream
+        );
+        assert_eq!(
+            choose_kitty_transfer_mode(false, true, true),
+            KittyTransferMode::Stream
+        );
     }
 }
