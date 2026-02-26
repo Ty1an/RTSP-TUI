@@ -41,8 +41,8 @@ pub struct ViewArgs {
     #[arg(long, default_value_t = 24)]
     pub refresh_fps: u16,
 
-    /// Maximum stream-to-terminal conversion rate per stream.
-    #[arg(long, default_value_t = 15)]
+    /// Maximum stream-to-terminal conversion rate per stream (1-20).
+    #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u16).range(1..=20))]
     pub target_fps: u16,
 
     /// RTSP transport protocol to request.

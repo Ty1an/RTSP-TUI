@@ -33,18 +33,33 @@ struct TileSnapshot {
     stream_label: String,
     frame_ascii: String,
     status: String,
-    frames_rendered: u64,
-    decode_errors: u64,
+    displayed_fps: f32,
+    display_window_started_at: Instant,
+    display_window_frames: u32,
+    last_displayed_at: Instant,
 }
 
 impl TileSnapshot {
     fn new(stream_label: String) -> Self {
+        let now = Instant::now();
         Self {
             stream_label,
             frame_ascii: String::new(),
             status: "connecting".to_owned(),
-            frames_rendered: 0,
-            decode_errors: 0,
+            displayed_fps: 0.0,
+            display_window_started_at: now,
+            display_window_frames: 0,
+            last_displayed_at: now,
+        }
+    }
+
+    fn displayed_fps_for_title(&self) -> f32 {
+        if Instant::now().saturating_duration_since(self.last_displayed_at)
+            >= Duration::from_millis(1_200)
+        {
+            0.0
+        } else {
+            self.displayed_fps
         }
     }
 }
@@ -66,20 +81,24 @@ impl TileState {
     }
 
     fn set_frame(&self, frame_ascii: String) {
+        let now = Instant::now();
         let mut snapshot = self.inner.write();
         snapshot.frame_ascii = frame_ascii;
-        snapshot.frames_rendered = snapshot.frames_rendered.saturating_add(1);
+        snapshot.display_window_frames = snapshot.display_window_frames.saturating_add(1);
+        snapshot.last_displayed_at = now;
+        let elapsed = now.saturating_duration_since(snapshot.display_window_started_at);
+        if elapsed >= Duration::from_millis(500) {
+            let secs = elapsed.as_secs_f32().max(0.001);
+            snapshot.displayed_fps = snapshot.display_window_frames as f32 / secs;
+            snapshot.display_window_started_at = now;
+            snapshot.display_window_frames = 0;
+        }
         "streaming".clone_into(&mut snapshot.status);
     }
 
-    fn inc_decode_error(&self) {
-        let mut snapshot = self.inner.write();
-        snapshot.decode_errors = snapshot.decode_errors.saturating_add(1);
-    }
+    fn inc_decode_error(&self) {}
 
-    fn snapshot(&self) -> TileSnapshot {
-        self.inner.read().clone()
-    }
+    fn inc_dropped_frame(&self) {}
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,7 +135,7 @@ pub async fn run_view(args: &ViewArgs) -> Result<()> {
         let worker_geometry_rx = geometry_rx.clone();
         let worker_stream = stream_url.clone();
         let worker_transport = args.transport;
-        let worker_target_fps = args.target_fps.max(1);
+        let worker_target_fps = args.target_fps.clamp(1, 20);
 
         workers.push(tokio::spawn(async move {
             run_stream_worker(
@@ -203,23 +222,24 @@ async fn render_loop(
                     }
 
                     let area = grid_rects[idx];
-                    let snapshot = tile.snapshot();
+                    let snapshot = tile.inner.read();
+                    let displayed_fps = snapshot.displayed_fps_for_title();
                     let title = format!(
-                        "{} | {} | frames={} decode_errs={}",
+                        "{} | {} | fps={:.1}",
                         idx + 1,
                         snapshot.stream_label,
-                        snapshot.frames_rendered,
-                        snapshot.decode_errors
+                        displayed_fps
                     );
-
-                    let body = if snapshot.frame_ascii.is_empty() {
-                        format!("status: {}", snapshot.status)
-                    } else {
-                        snapshot.frame_ascii
-                    };
-
                     let block = Block::default().title(title).borders(Borders::ALL);
-                    frame.render_widget(Paragraph::new(body).block(block), area);
+                    if snapshot.frame_ascii.is_empty() {
+                        let body = format!("status: {}", snapshot.status);
+                        frame.render_widget(Paragraph::new(body).block(block), area);
+                    } else {
+                        frame.render_widget(
+                            Paragraph::new(snapshot.frame_ascii.as_str()).block(block),
+                            area,
+                        );
+                    }
                 }
 
                 let footer = Paragraph::new("q/esc: quit | terminal RTSP grid viewer");
@@ -519,7 +539,8 @@ async fn run_stream_session(
             let _ = decoder.decode(&extra_config);
         }
 
-        if let Err(err) = avcc_frame_to_annexb(frame.data(), &mut frame_buffer) {
+        let avcc = frame.into_data();
+        if let Err(err) = avcc_frame_to_annexb(&avcc, &mut frame_buffer) {
             tile.inc_decode_error();
             tile.set_status(format!("frame convert error: {err:#}"));
             continue;
@@ -528,6 +549,7 @@ async fn run_stream_session(
         match decoder.decode(&frame_buffer) {
             Ok(Some(yuv)) => {
                 if last_render.elapsed() < target_interval {
+                    tile.inc_dropped_frame();
                     continue;
                 }
 
@@ -574,7 +596,8 @@ fn percent_decode_userinfo(value: &str) -> String {
     let mut idx = 0;
 
     while idx < bytes.len() {
-        if bytes[idx] == b'%' && idx + 2 < bytes.len()
+        if bytes[idx] == b'%'
+            && idx + 2 < bytes.len()
             && let (Some(hi), Some(lo)) = (hex_value(bytes[idx + 1]), hex_value(bytes[idx + 2]))
         {
             decoded.push((hi << 4) | lo);
@@ -629,6 +652,10 @@ fn read_h264_extra_config(
 
 fn avcc_frame_to_annexb(input: &[u8], output: &mut Vec<u8>) -> Result<()> {
     output.clear();
+    let extra_needed = input.len().saturating_sub(output.capacity());
+    if extra_needed > 0 {
+        output.reserve(extra_needed);
+    }
 
     let mut cursor = 0_usize;
     while cursor + 4 <= input.len() {

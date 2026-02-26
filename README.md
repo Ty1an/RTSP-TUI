@@ -52,7 +52,6 @@ cargo install --path .
 ```bash
 cargo run --release
 ```
-
 ## Quick Start (TUI)
 
 ```bash
